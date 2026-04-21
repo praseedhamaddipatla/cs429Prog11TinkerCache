@@ -26,6 +26,7 @@
 typedef struct {
     uint8_t valid;
     uint8_t modified;
+    uint64_t tag;
     uint8_t data[64];
 } cache_line_t;
 
