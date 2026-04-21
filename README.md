@@ -12,3 +12,39 @@ To run:./build/hw11
 To compare the LRU and Random replacement policies, I designed two targeted access patterns that stress the L1-D cache in different ways. The first test (Test 5) performs four sequential passes over a 64 KB array using both policies, with Random averaged over 10 runs to reduce noise from its nondeterminism. The second test (Test 6) constructs an explicit thrashing pattern by repeatedly cycling through 3 addresses that all map to the same 2-way L1-D set — one more address than there are ways, which is the classic worst case for any deterministic policy. Both tests measure L1-D miss counts as the primary metric, since that is where the two policies diverge most visibly at this cache size.
 
 Both tests showed Random outperforming LRU. On the 64 KB sequential scan, LRU produced 4096 L1-D misses across all four passes while Random averaged approximately 3651 — because the 64 KB working set maps exactly 4 lines to every 2-way set, creating a thrashing condition where LRU deterministically evicts the line that will be needed soonest on the next pass. On the explicit thrash pattern, LRU missed on every single one of the 6000 accesses (100% miss rate) while Random averaged around 4002 misses (67%), since Random occasionally keeps a useful line by chance. These results confirm the well-known weakness of LRU: it performs optimally when there is genuine temporal locality, but degrades badly under adversarial or capacity-exceeding access patterns, where Random's unpredictability becomes an advantage.
+
+Raw Test Results:
+
+=== TEST 1: Basic read/write correctness ===
+  Policy=LRU     errors=0  PASS
+  Policy=RANDOM  errors=0  PASS
+
+=== TEST 2: Cache line pointer lookups ===
+  After read(0x0000): L1-D ptr=non-null  PASS=yes
+  After read(0x0000): L2   ptr=non-null  PASS=yes
+  Unloaded addr 0x20000: L1-D ptr=null  PASS=yes
+
+=== TEST 3: INSTR vs DATA separation ===
+  L1-I accesses=64 (expected 64)  PASS=yes
+  L1-D accesses=64 (expected 64)  PASS=yes
+  L1-I misses=1 (expected 1, one cold miss per 64-byte line)
+  L1-D misses=1 (expected 1)
+
+=== TEST 4: Write-back to main memory ===
+  mem[0x0000] = 0xAB (expected 0xAB)  PASS=yes
+
+=== TEST 5: LRU vs Random – sequential scan (64 KB x 4 passes) ===
+  LRU   L1-D misses=4096     L2 misses=1024  
+  RND   L1-D misses=3635     L2 misses=1024    (avg over 10 runs)
+  LRU >=  Random for sequential scan (expected: LRU >= for overflowing scan)
+
+=== TEST 6: LRU vs Random – thrashing pattern ===
+  LRU  thrash L1-D misses = 6000 / 6000 accesses
+  RND  thrash L1-D misses = 3993 / 6000 accesses  (avg 10 runs)
+  Random <= LRU on thrash pattern (expected: Random <=)
+
+=== TEST 7: Modified (dirty) bit ===
+  After read:  modified=0 (expected 0)  PASS=yes
+  After write: modified=1 (expected 1)  PASS=yes
+
+  All tests complete.
