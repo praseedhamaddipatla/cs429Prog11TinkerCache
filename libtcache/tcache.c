@@ -380,25 +380,30 @@ uint8_t read_cache(uint64_t mem_addr, mem_type_t type) {
 void write_cache(uint64_t mem_addr, uint8_t value, mem_type_t type) {
     uint64_t off  = line_offset(mem_addr);
     uint64_t base = mem_addr & ~LINE_MASK;
-
+ 
     if (type == INSTR) {
         /* INSTR writes go to L1-I */
         uint64_t s  = l1i_idx(mem_addr);
         uint64_t tg = l1i_tag(mem_addr);
         l1i_stats.accesses++;
-
-        /* Coherency: invalidate stale L1-D copy (not an access) */
+ 
+        /* Coherency: if L1-D has a dirty copy, write it back to L2 first,
+         * then invalidate it.  A silent drop of dirty data violates
+         * write-back semantics and corrupts the inclusive-cache invariant. */
         {
             uint64_t ds  = l1d_idx(base);
             uint64_t dtg = l1d_tag(base);
             for (int w = 0; w < L1D_WAYS; w++) {
                 if (l1d[ds][w].valid && l1d[ds][w].tag == dtg) {
+                    if (l1d[ds][w].modified) {          /* FIX: writeback dirty data */
+                        writeback_to_l2(base, l1d[ds][w].data);
+                    }
                     l1d[ds][w].valid = 0;
                     break;
                 }
             }
         }
-
+ 
         /* L1-I hit */
         for (int w = 0; w < L1I_WAYS; w++) {
             if (l1i[s][w].valid && l1i[s][w].tag == tg) {
@@ -408,42 +413,46 @@ void write_cache(uint64_t mem_addr, uint8_t value, mem_type_t type) {
                 return;
             }
         }
-
+ 
         /* L1-I write miss — write-allocate: fetch from L2 first */
         l1i_stats.misses++;
-
+ 
         cache_line_t *l2line = fill_from_l2(mem_addr);
-
+ 
         int victim = pick_victim(l1i[s], l1i_lru[s], L1I_WAYS);
         if (l1i[s][victim].valid && l1i[s][victim].modified) {
             uint64_t evict_base = l1i_base(s, l1i[s][victim].tag);
             writeback_to_l2(evict_base, l1i[s][victim].data);
         }
-
+ 
         l1i[s][victim].valid     = 1;
         l1i[s][victim].modified  = 1;
         l1i[s][victim].tag       = tg;
         l1i_lru[s][victim]       = ++lru_clock;
         memcpy(l1i[s][victim].data, l2line->data, LINE_SIZE);
         l1i[s][victim].data[off] = value;
-
+ 
     } else {
         /* DATA writes go to L1-D */
         uint64_t s  = l1d_idx(mem_addr);
         uint64_t tg = l1d_tag(mem_addr);
         l1d_stats.accesses++;
-
-        /* Coherency: invalidate stale L1-I copy (not an access) */
+ 
+        /* Coherency: if L1-I has a dirty copy, write it back to L2 first,
+         * then invalidate it.  Same rationale as the INSTR case above. */
         {
             uint64_t is  = l1i_idx(base);
             uint64_t itg = l1i_tag(base);
             for (int w = 0; w < L1I_WAYS; w++) {
                 if (l1i[is][w].valid && l1i[is][w].tag == itg) {
+                    if (l1i[is][w].modified) {          /* FIX: writeback dirty data */
+                        writeback_to_l2(base, l1i[is][w].data);
+                    }
                     l1i[is][w].valid = 0;
                 }
             }
         }
-
+ 
         /* L1-D hit */
         for (int w = 0; w < L1D_WAYS; w++) {
             if (l1d[s][w].valid && l1d[s][w].tag == tg) {
@@ -453,18 +462,18 @@ void write_cache(uint64_t mem_addr, uint8_t value, mem_type_t type) {
                 return;
             }
         }
-
+ 
         /* L1-D write miss — write-allocate: fetch from L2 first */
         l1d_stats.misses++;
-
+ 
         cache_line_t *l2line = fill_from_l2(mem_addr);
-
+ 
         int victim = pick_victim(l1d[s], l1d_lru[s], L1D_WAYS);
         if (l1d[s][victim].valid && l1d[s][victim].modified) {
             writeback_to_l2(l1d_base(s, l1d[s][victim].tag),
                             l1d[s][victim].data);
         }
-
+ 
         l1d[s][victim].valid     = 1;
         l1d[s][victim].modified  = 1;
         l1d[s][victim].tag       = tg;
