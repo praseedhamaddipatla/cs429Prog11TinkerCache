@@ -61,6 +61,9 @@ static inline uint64_t line_offset(uint64_t a) { return a & LINE_MASK; }
 
 static inline uint64_t l1i_idx(uint64_t a) { return (a >> LINE_BITS) & (L1I_SETS - 1); }
 static inline uint64_t l1i_tag(uint64_t a) { return  a >> (LINE_BITS + L1I_IDX_BITS); }
+static inline uint64_t l1i_base(uint64_t idx, uint64_t tag) {
+    return (tag << (LINE_BITS + L1I_IDX_BITS)) | (idx << LINE_BITS);
+}
 
 static inline uint64_t l1d_idx(uint64_t a) { return (a >> LINE_BITS) & (L1D_SETS - 1); }
 static inline uint64_t l1d_tag(uint64_t a) { return  a >> (LINE_BITS + L1D_IDX_BITS); }
@@ -92,76 +95,17 @@ static int pick_victim(cache_line_t *ways, uint32_t *stamps, int num_ways) {
 }
 
 /* ==============================================================
- * L1-I INVALIDATION  (not an access)
- * ============================================================== */
-static void l1i_invalidate(uint64_t base_addr) {
-    uint64_t s  = l1i_idx(base_addr);
-    uint64_t tg = l1i_tag(base_addr);
-    for (int w = 0; w < L1I_WAYS; w++) {
-        if (l1i[s][w].valid && l1i[s][w].tag == tg) {
-            l1i[s][w].valid = 0;
-        }
-    }
-}
-
-/* ==============================================================
- * L2 INCLUSIVE EVICTION
- *
- * When L2 evicts a line it must also invalidate that line from
- * any L1 cache that holds it.  If the L1-D copy is dirty, flush
- * it straight to main memory (L2 is being evicted too).
- * ============================================================== */
-static void l2_evict_inclusive(uint64_t l2_s, int v) {
-    cache_line_t *lc = &l2[l2_s][v];
-    if (!lc->valid) return;
-
-    uint64_t base = l2_base(l2_s, lc->tag);
-
-    /* Flush dirty L2 line to main memory */
-    if (lc->modified) {
-        for (int b = 0; b < LINE_SIZE; b++) {
-            write_memory(base + b, lc->data[b]);
-        }
-        lc->modified = 0;
-    }
-
-    /* Invalidate L1-I (always clean — no writeback needed) */
-    l1i_invalidate(base);
-
-    /* Invalidate L1-D; if dirty, flush to main memory */
-    {
-        uint64_t ds  = l1d_idx(base);
-        uint64_t dtg = l1d_tag(base);
-        for (int w = 0; w < L1D_WAYS; w++) {
-            if (l1d[ds][w].valid && l1d[ds][w].tag == dtg) {
-                if (l1d[ds][w].modified) {
-                    for (int b = 0; b < LINE_SIZE; b++) {
-                        write_memory(base + b, l1d[ds][w].data[b]);
-                    }
-                    l1d[ds][w].modified = 0;
-                }
-                l1d[ds][w].valid = 0;
-                break;
-            }
-        }
-    }
-
-    lc->valid = 0;
-}
-
-/* ==============================================================
- * WRITEBACK: dirty line → L2  (counts as L2 access)
+ * WRITEBACK: dirty line → L2  (counts as one L2 access)
  *
  * Used for:
  *   (a) L1-D eviction writeback
- *   (b) L1-D coherency writeback before L1-I read (per TA clarification:
- *       "write backs from L1 due to eviction or other means" = L2 access)
+ *   (b) L1-I eviction writeback  (L1-I lines CAN be modified by INSTR writes)
+ *   (c) L1-D coherency writeback before L1-I reads (per TA spec)
  * ============================================================== */
 static void writeback_to_l2(uint64_t base_addr, uint8_t *data) {
     uint64_t s  = l2_idx(base_addr);
     uint64_t tg = l2_tag(base_addr);
 
-    /* This writeback counts as an L2 access */
     l2_stats_g.accesses++;
 
     for (int w = 0; w < L2_WAYS; w++) {
@@ -176,7 +120,48 @@ static void writeback_to_l2(uint64_t base_addr, uint8_t *data) {
     /* L2 miss on writeback — install the line */
     l2_stats_g.misses++;
     int victim = pick_victim(l2[s], l2_lru[s], L2_WAYS);
-    l2_evict_inclusive(s, victim);
+
+    /* evict L2 victim (inclusive: also invalidate from L1s) */
+    if (l2[s][victim].valid) {
+        uint64_t evict_base = l2_base(s, l2[s][victim].tag);
+        if (l2[s][victim].modified) {
+            for (int b = 0; b < LINE_SIZE; b++) {
+                write_memory(evict_base + b, l2[s][victim].data[b]);
+            }
+        }
+        /* invalidate L1-I copy */
+        {
+            uint64_t is  = l1i_idx(evict_base);
+            uint64_t itg = l1i_tag(evict_base);
+            for (int w = 0; w < L1I_WAYS; w++) {
+                if (l1i[is][w].valid && l1i[is][w].tag == itg) {
+                    if (l1i[is][w].modified) {
+                        for (int b = 0; b < LINE_SIZE; b++) {
+                            write_memory(evict_base + b, l1i[is][w].data[b]);
+                        }
+                    }
+                    l1i[is][w].valid = 0;
+                }
+            }
+        }
+        /* invalidate L1-D copy */
+        {
+            uint64_t ds  = l1d_idx(evict_base);
+            uint64_t dtg = l1d_tag(evict_base);
+            for (int w = 0; w < L1D_WAYS; w++) {
+                if (l1d[ds][w].valid && l1d[ds][w].tag == dtg) {
+                    if (l1d[ds][w].modified) {
+                        for (int b = 0; b < LINE_SIZE; b++) {
+                            write_memory(evict_base + b, l1d[ds][w].data[b]);
+                        }
+                    }
+                    l1d[ds][w].valid = 0;
+                    break;
+                }
+            }
+        }
+        l2[s][victim].valid = 0;
+    }
 
     l2[s][victim].valid    = 1;
     l2[s][victim].modified = 1;
@@ -189,6 +174,7 @@ static void writeback_to_l2(uint64_t base_addr, uint8_t *data) {
  * FILL FROM L2  (or main memory on L2 miss)
  *
  * Fetches the cache line into L2 if absent.  Counts as one L2 access.
+ * On L2 eviction, invalidates L1 copies (inclusive).
  * ============================================================== */
 static cache_line_t *fill_from_l2(uint64_t mem_addr) {
     uint64_t base = mem_addr & ~LINE_MASK;
@@ -208,11 +194,53 @@ static cache_line_t *fill_from_l2(uint64_t mem_addr) {
     l2_stats_g.misses++;
 
     int victim = pick_victim(l2[s], l2_lru[s], L2_WAYS);
-    l2_evict_inclusive(s, victim);
+
+    /* evict L2 victim (inclusive: also invalidate from L1s) */
+    if (l2[s][victim].valid) {
+        uint64_t evict_base = l2_base(s, l2[s][victim].tag);
+        if (l2[s][victim].modified) {
+            for (int b = 0; b < LINE_SIZE; b++) {
+                write_memory(evict_base + b, l2[s][victim].data[b]);
+            }
+        }
+        /* invalidate L1-I copy */
+        {
+            uint64_t is  = l1i_idx(evict_base);
+            uint64_t itg = l1i_tag(evict_base);
+            for (int w = 0; w < L1I_WAYS; w++) {
+                if (l1i[is][w].valid && l1i[is][w].tag == itg) {
+                    if (l1i[is][w].modified) {
+                        for (int b = 0; b < LINE_SIZE; b++) {
+                            write_memory(evict_base + b, l1i[is][w].data[b]);
+                        }
+                    }
+                    l1i[is][w].valid = 0;
+                }
+            }
+        }
+        /* invalidate L1-D copy */
+        {
+            uint64_t ds  = l1d_idx(evict_base);
+            uint64_t dtg = l1d_tag(evict_base);
+            for (int w = 0; w < L1D_WAYS; w++) {
+                if (l1d[ds][w].valid && l1d[ds][w].tag == dtg) {
+                    if (l1d[ds][w].modified) {
+                        for (int b = 0; b < LINE_SIZE; b++) {
+                            write_memory(evict_base + b, l1d[ds][w].data[b]);
+                        }
+                    }
+                    l1d[ds][w].valid = 0;
+                    break;
+                }
+            }
+        }
+        l2[s][victim].valid = 0;
+    }
 
     l2[s][victim].valid    = 1;
     l2[s][victim].modified = 0;
     l2[s][victim].tag      = tg;
+    /* lru handled via l2_lru array below */
     l2_lru[s][victim]      = ++lru_clock;
     for (int b = 0; b < LINE_SIZE; b++) {
         l2[s][victim].data[b] = read_memory(base + b);
@@ -261,12 +289,9 @@ uint8_t read_cache(uint64_t mem_addr, mem_type_t type) {
         /* L1-I miss */
         l1i_stats.misses++;
 
-        /*
-         * Coherency: if L1-D has a dirty copy, write it back to L2
-         * so L1-I reads the latest data from L2.
-         * Per TA: "write backs from L1 due to ... other means" = L2 access.
-         * L1-D remains valid but becomes clean after the writeback.
-         */
+        /* Coherency: if L1-D has a dirty copy, write it back to L2
+         * so that L1-I reads the latest data.
+         * "Write backs from L1 due to other means" = L2 access. */
         {
             uint64_t ds  = l1d_idx(base);
             uint64_t dtg = l1d_tag(base);
@@ -283,8 +308,13 @@ uint8_t read_cache(uint64_t mem_addr, mem_type_t type) {
         /* Fetch from L2 (one L2 access) */
         cache_line_t *l2line = fill_from_l2(mem_addr);
 
-        /* Install into L1-I */
+        /* Evict from L1-I if necessary, writing back dirty lines */
         int victim = pick_victim(l1i[s], l1i_lru[s], L1I_WAYS);
+        if (l1i[s][victim].valid && l1i[s][victim].modified) {
+            uint64_t evict_base = l1i_base(s, l1i[s][victim].tag);
+            writeback_to_l2(evict_base, l1i[s][victim].data);
+        }
+
         l1i[s][victim].valid    = 1;
         l1i[s][victim].modified = 0;
         l1i[s][victim].tag      = tg;
@@ -329,44 +359,100 @@ uint8_t read_cache(uint64_t mem_addr, mem_type_t type) {
 
 /* -------------------------------------------------------------- */
 void write_cache(uint64_t mem_addr, uint8_t value, mem_type_t type) {
-    (void)type;  /* writes always target L1-D regardless of type */
     uint64_t off  = line_offset(mem_addr);
     uint64_t base = mem_addr & ~LINE_MASK;
-    uint64_t s    = l1d_idx(mem_addr);
-    uint64_t tg   = l1d_tag(mem_addr);
 
-    l1d_stats.accesses++;
+    if (type == INSTR) {
+        /* INSTR writes go to L1-I */
+        uint64_t s  = l1i_idx(mem_addr);
+        uint64_t tg = l1i_tag(mem_addr);
+        l1i_stats.accesses++;
 
-    /* Coherency: invalidate stale L1-I copy (not an access) */
-    l1i_invalidate(base);
-
-    /* L1-D hit */
-    for (int w = 0; w < L1D_WAYS; w++) {
-        if (l1d[s][w].valid && l1d[s][w].tag == tg) {
-            l1d[s][w].data[off] = value;
-            l1d[s][w].modified  = 1;
-            l1d_lru[s][w]       = ++lru_clock;
-            return;
+        /* Coherency: invalidate stale L1-D copy (not an access) */
+        {
+            uint64_t ds  = l1d_idx(base);
+            uint64_t dtg = l1d_tag(base);
+            for (int w = 0; w < L1D_WAYS; w++) {
+                if (l1d[ds][w].valid && l1d[ds][w].tag == dtg) {
+                    l1d[ds][w].valid = 0;
+                    break;
+                }
+            }
         }
+
+        /* L1-I hit */
+        for (int w = 0; w < L1I_WAYS; w++) {
+            if (l1i[s][w].valid && l1i[s][w].tag == tg) {
+                l1i[s][w].data[off] = value;
+                l1i[s][w].modified  = 1;
+                l1i_lru[s][w]       = ++lru_clock;
+                return;
+            }
+        }
+
+        /* L1-I write miss — write-allocate: fetch from L2 first */
+        l1i_stats.misses++;
+
+        cache_line_t *l2line = fill_from_l2(mem_addr);
+
+        int victim = pick_victim(l1i[s], l1i_lru[s], L1I_WAYS);
+        if (l1i[s][victim].valid && l1i[s][victim].modified) {
+            uint64_t evict_base = l1i_base(s, l1i[s][victim].tag);
+            writeback_to_l2(evict_base, l1i[s][victim].data);
+        }
+
+        l1i[s][victim].valid     = 1;
+        l1i[s][victim].modified  = 1;
+        l1i[s][victim].tag       = tg;
+        l1i_lru[s][victim]       = ++lru_clock;
+        memcpy(l1i[s][victim].data, l2line->data, LINE_SIZE);
+        l1i[s][victim].data[off] = value;
+
+    } else {
+        /* DATA writes go to L1-D */
+        uint64_t s  = l1d_idx(mem_addr);
+        uint64_t tg = l1d_tag(mem_addr);
+        l1d_stats.accesses++;
+
+        /* Coherency: invalidate stale L1-I copy (not an access) */
+        {
+            uint64_t is  = l1i_idx(base);
+            uint64_t itg = l1i_tag(base);
+            for (int w = 0; w < L1I_WAYS; w++) {
+                if (l1i[is][w].valid && l1i[is][w].tag == itg) {
+                    l1i[is][w].valid = 0;
+                }
+            }
+        }
+
+        /* L1-D hit */
+        for (int w = 0; w < L1D_WAYS; w++) {
+            if (l1d[s][w].valid && l1d[s][w].tag == tg) {
+                l1d[s][w].data[off] = value;
+                l1d[s][w].modified  = 1;
+                l1d_lru[s][w]       = ++lru_clock;
+                return;
+            }
+        }
+
+        /* L1-D write miss — write-allocate: fetch from L2 first */
+        l1d_stats.misses++;
+
+        cache_line_t *l2line = fill_from_l2(mem_addr);
+
+        int victim = pick_victim(l1d[s], l1d_lru[s], L1D_WAYS);
+        if (l1d[s][victim].valid && l1d[s][victim].modified) {
+            writeback_to_l2(l1d_base(s, l1d[s][victim].tag),
+                            l1d[s][victim].data);
+        }
+
+        l1d[s][victim].valid     = 1;
+        l1d[s][victim].modified  = 1;
+        l1d[s][victim].tag       = tg;
+        l1d_lru[s][victim]       = ++lru_clock;
+        memcpy(l1d[s][victim].data, l2line->data, LINE_SIZE);
+        l1d[s][victim].data[off] = value;
     }
-
-    /* L1-D write miss — write-allocate: fetch line from L2 first */
-    l1d_stats.misses++;
-
-    cache_line_t *l2line = fill_from_l2(mem_addr);
-
-    int victim = pick_victim(l1d[s], l1d_lru[s], L1D_WAYS);
-    if (l1d[s][victim].valid && l1d[s][victim].modified) {
-        writeback_to_l2(l1d_base(s, l1d[s][victim].tag),
-                        l1d[s][victim].data);
-    }
-
-    l1d[s][victim].valid     = 1;
-    l1d[s][victim].modified  = 1;
-    l1d[s][victim].tag       = tg;
-    l1d_lru[s][victim]       = ++lru_clock;
-    memcpy(l1d[s][victim].data, l2line->data, LINE_SIZE);
-    l1d[s][victim].data[off] = value;
 }
 
 /* -------------------------------------------------------------- */
