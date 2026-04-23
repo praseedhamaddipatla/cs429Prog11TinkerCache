@@ -9,11 +9,15 @@ To compile:./build.sh
 
 To run:./build/hw11
 
-To compare the LRU and Random replacement policies, I designed two targeted access patterns that stress the L1-D cache in different ways. The first test (Test 5) performs four sequential passes over a 64 KB array using both policies, with Random averaged over 10 runs to reduce noise from its nondeterminism. The second test (Test 6) constructs an explicit thrashing pattern by repeatedly cycling through 3 addresses that all map to the same 2-way L1-D set — one more address than there are ways, which is the classic worst case for any deterministic policy. Both tests measure L1-D miss counts as the primary metric, since that is where the two policies diverge most visibly at this cache size.
+To compare the LRU and Random replacement policies, I used a few targeted access patterns that stress the L1-D cache in different ways. In Test 5A, I used a small pattern (A, B, A, C) that repeatedly accesses two useful lines while occasionally introducing a third conflicting line in the same 2-way set. In Test 5B, I ran a 16 KB array scan over four passes, where the working set fits entirely in L1-D after the initial warmup. Finally, in Test 6, I constructed a thrashing pattern by cycling through three addresses (A, B, C) that all map to the same 2-way set. Across all tests, I measured L1-D miss counts as the main metric, since that is where the differences between LRU and Random show up most clearly.
 
-Both tests showed Random outperforming LRU. On the 64 KB sequential scan, LRU produced 4096 L1-D misses across all four passes while Random averaged approximately 3651 — because the 64 KB working set maps exactly 4 lines to every 2-way set, creating a thrashing condition where LRU deterministically evicts the line that will be needed soonest on the next pass. On the explicit thrash pattern, LRU missed on every single one of the 6000 accesses (100% miss rate) while Random averaged around 4002 misses (67%), since Random occasionally keeps a useful line by chance. These results confirm the well-known weakness of LRU: it performs optimally when there is genuine temporal locality, but degrades badly under adversarial or capacity-exceeding access patterns, where Random's unpredictability becomes an advantage.
+The results show that neither policy is strictly better; the performance depends on the access pattern. In Test 5A, LRU outperformed Random (8001 misses vs. ~9612 on average) because it correctly keeps recently used lines (A and B) in the cache, while Random sometimes evicts them unnecessarily. In Test 5B, both policies performed identically (256 misses each) since the working set fits in the cache, so after the initial compulsory misses, replacement policy doesn’t matter. However, in the thrashing case (Test 6), Random clearly did better: LRU had a 100% miss rate (6000 misses), while Random averaged about 3992 misses (~67%). This happens because LRU is deterministic and always evicts the line that will be needed next in this adversarial pattern, while Random occasionally “gets lucky” and keeps a useful line. Overall, these results highlight that LRU works best when there is strong temporal locality, but can perform poorly in adversarial cases, whereas Random is less predictable but sometimes advantageous if thrashing.
 
 Raw Test Results:
+
+============================================
+  TCache Test Suite
+============================================
 
 === TEST 1: Basic read/write correctness ===
   Policy=LRU     errors=0  PASS
@@ -33,18 +37,28 @@ Raw Test Results:
 === TEST 4: Write-back to main memory ===
   mem[0x0000] = 0xAB (expected 0xAB)  PASS=yes
 
-=== TEST 5: LRU vs Random – sequential scan (64 KB x 4 passes) ===
-  LRU   L1-D misses=4096     L2 misses=1024  
-  RND   L1-D misses=3635     L2 misses=1024    (avg over 10 runs)
-  LRU >=  Random for sequential scan (expected: LRU >= for overflowing scan)
+=== TEST 5A: LRU vs Random – hot set with occasional spoiler ===
+  Pattern: A, B, A, C on one 2-way set (16000 total accesses)
+  LRU   L1-D misses=8001     L2 misses=3     
+  RND   L1-D misses=9612     L2 misses=3       (avg over 20 seeds)
+  Expected: LRU <= Random because recent lines are reused before the spoiler returns.
+
+=== TEST 5B: LRU vs Random – working set fits in L1-D ===
+  Scan: 16 KB x 4 passes
+  LRU   L1-D misses=256      L2 misses=256   
+  RND   L1-D misses=256      L2 misses=256     (avg over 20 seeds)
+  Expected: both policies are similar once the working set fits after warmup.
 
 === TEST 6: LRU vs Random – thrashing pattern ===
-  LRU  thrash L1-D misses = 6000 / 6000 accesses
-  RND  thrash L1-D misses = 3993 / 6000 accesses  (avg 10 runs)
-  Random <= LRU on thrash pattern (expected: Random <=)
+  Pattern: A, B, C on one 2-way set (6000 total accesses)
+  LRU   L1-D misses=6000     L2 misses=3     
+  RND   L1-D misses=3992     L2 misses=3       (avg over 20 seeds)
+  Expected: Random <= LRU because this pattern is adversarial to recency.
 
 === TEST 7: Modified (dirty) bit ===
   After read:  modified=0 (expected 0)  PASS=yes
   After write: modified=1 (expected 1)  PASS=yes
 
+============================================
   All tests complete.
+============================================

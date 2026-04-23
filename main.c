@@ -32,6 +32,96 @@ static void print_stats(const char *label) {
            l2.accesses ? 100.0 * l2.misses / l2.accesses : 0.0);
 }
 
+typedef struct {
+    uint64_t l1d_misses;
+    uint64_t l2_misses;
+} miss_result_t;
+
+static miss_result_t run_data_pattern(const uint64_t *pattern, int pattern_len,
+                                      int repeats, replacement_policy_e policy,
+                                      unsigned seed) {
+    reset_memory();
+    init_cache(policy);
+
+    /* The cache library seeds RANDOM deterministically for grader stability.
+     * For comparison experiments, override that seed so multiple Random runs
+     * actually sample different victim choices. */
+    if (policy == RANDOM) {
+        srand(seed);
+    }
+
+    for (int rep = 0; rep < repeats; rep++) {
+        for (int i = 0; i < pattern_len; i++) {
+            read_cache(pattern[i], DATA);
+        }
+    }
+
+    miss_result_t result = {
+        .l1d_misses = get_l1_data_stats().misses,
+        .l2_misses = get_l2_stats().misses
+    };
+    return result;
+}
+
+static miss_result_t average_random_pattern(const uint64_t *pattern, int pattern_len,
+                                            int repeats, int runs,
+                                            unsigned seed_base) {
+    miss_result_t total = {0, 0};
+
+    for (int r = 0; r < runs; r++) {
+        miss_result_t run = run_data_pattern(pattern, pattern_len, repeats,
+                                             RANDOM, seed_base + (unsigned)r);
+        total.l1d_misses += run.l1d_misses;
+        total.l2_misses += run.l2_misses;
+    }
+
+    miss_result_t avg = {
+        .l1d_misses = total.l1d_misses / (uint64_t)runs,
+        .l2_misses = total.l2_misses / (uint64_t)runs
+    };
+    return avg;
+}
+
+static miss_result_t run_data_scan(uint64_t base, uint64_t bytes, int passes,
+                                   replacement_policy_e policy, unsigned seed) {
+    reset_memory();
+    init_cache(policy);
+
+    if (policy == RANDOM) {
+        srand(seed);
+    }
+
+    for (int p = 0; p < passes; p++) {
+        for (uint64_t i = 0; i < bytes; i++) {
+            read_cache(base + i, DATA);
+        }
+    }
+
+    miss_result_t result = {
+        .l1d_misses = get_l1_data_stats().misses,
+        .l2_misses = get_l2_stats().misses
+    };
+    return result;
+}
+
+static miss_result_t average_random_scan(uint64_t base, uint64_t bytes, int passes,
+                                         int runs, unsigned seed_base) {
+    miss_result_t total = {0, 0};
+
+    for (int r = 0; r < runs; r++) {
+        miss_result_t run = run_data_scan(base, bytes, passes,
+                                          RANDOM, seed_base + (unsigned)r);
+        total.l1d_misses += run.l1d_misses;
+        total.l2_misses += run.l2_misses;
+    }
+
+    miss_result_t avg = {
+        .l1d_misses = total.l1d_misses / (uint64_t)runs,
+        .l2_misses = total.l2_misses / (uint64_t)runs
+    };
+    return avg;
+}
+
 /* ---------------------------------------------------------------
  * TEST 1 – Basic read/write correctness
  *
@@ -164,100 +254,103 @@ static void test_writeback(void) {
 }
 
 /* ---------------------------------------------------------------
- * TEST 5 – LRU vs Random miss comparison on a large sequential
- *          scan that overflows L1-D.
+ * TEST 5A – LRU-friendly locality pattern.
  *
- * Scan a 64 KB array (> 32 KB L1-D) forward 4 times.
- * LRU should yield fewer or equal L1-D misses than Random on
- * average for sequential access patterns.
- * We run Random 10 times and take the average to reduce noise.
+ * Pattern: A, B, A, C repeated on a single 2-way L1-D set.
+ * A is reused often enough that LRU protects it, while Random
+ * sometimes evicts A and pays extra misses later.
  * ------------------------------------------------------------- */
-#define SCAN_BYTES  (64 * 1024)   /* 64 KB, overflows 32 KB L1-D */
-#define SCAN_BASE   0x100000ULL   /* well within 16 MB            */
-#define SCAN_PASSES 4
+#define L1D_SET_STRIDE ((uint64_t)256 * 64)
 
-static void test_lru_vs_random(void) {
-    printf("\n=== TEST 5: LRU vs Random – sequential scan (%d KB x %d passes) ===\n",
-           SCAN_BYTES / 1024, SCAN_PASSES);
+static void test_lru_friendly_pattern(void) {
+    printf("\n=== TEST 5A: LRU vs Random – hot set with occasional spoiler ===\n");
 
-    /* ---- LRU ---- */
-    reset_memory();
-    init_cache(LRU);
-    for (int p = 0; p < SCAN_PASSES; p++)
-        for (uint64_t i = 0; i < SCAN_BYTES; i++)
-            read_cache(SCAN_BASE + i, DATA);
+    uint64_t pattern[] = {
+        0 * L1D_SET_STRIDE,  /* A */
+        1 * L1D_SET_STRIDE,  /* B */
+        0 * L1D_SET_STRIDE,  /* A again */
+        2 * L1D_SET_STRIDE   /* C spoiler */
+    };
+    int repeats = 4000;
+    int runs = 20;
 
-    cache_stats_t lru_ld = get_l1_data_stats();
-    cache_stats_t lru_l2 = get_l2_stats();
+    miss_result_t lru = run_data_pattern(pattern, 4, repeats, LRU, 0);
+    miss_result_t rnd = average_random_pattern(pattern, 4, repeats, runs, 100);
+
+    printf("  Pattern: A, B, A, C on one 2-way set (%d total accesses)\n",
+           repeats * 4);
     printf("  LRU   L1-D misses=%-8llu L2 misses=%-6llu\n",
-           (unsigned long long)lru_ld.misses,
-           (unsigned long long)lru_l2.misses);
-
-    /* ---- Random (average over 10 runs) ---- */
-    uint64_t total_l1d = 0, total_l2 = 0;
-    int runs = 10;
-    for (int r = 0; r < runs; r++) {
-        reset_memory();
-        init_cache(RANDOM);
-        for (int p = 0; p < SCAN_PASSES; p++)
-            for (uint64_t i = 0; i < SCAN_BYTES; i++)
-                read_cache(SCAN_BASE + i, DATA);
-        total_l1d += get_l1_data_stats().misses;
-        total_l2  += get_l2_stats().misses;
-    }
-    printf("  RND   L1-D misses=%-8llu L2 misses=%-6llu  (avg over %d runs)\n",
-           (unsigned long long)(total_l1d / runs),
-           (unsigned long long)(total_l2  / runs),
+           (unsigned long long)lru.l1d_misses,
+           (unsigned long long)lru.l2_misses);
+    printf("  RND   L1-D misses=%-8llu L2 misses=%-6llu  (avg over %d seeds)\n",
+           (unsigned long long)rnd.l1d_misses,
+           (unsigned long long)rnd.l2_misses,
            runs);
-
-    printf("  LRU %s Random for sequential scan (expected: LRU >= for overflowing scan)\n",
-           lru_ld.misses >= total_l1d / runs ? ">= " : "< ");
+    printf("  Expected: LRU <= Random because recent lines are reused before the spoiler returns.\n");
 }
 
 /* ---------------------------------------------------------------
- * TEST 6 – LRU vs Random on a strided / thrashing access pattern.
+ * TEST 5B – Neutral working-set test.
+ *
+ * Scan 16 KB repeatedly. The footprint fits inside the 32 KB L1-D,
+ * so after the first pass both policies should behave nearly the same.
+ * ------------------------------------------------------------- */
+#define FIT_SCAN_BYTES  (16 * 1024)
+#define FIT_SCAN_BASE   0x100000ULL
+#define FIT_SCAN_PASSES 4
+
+static void test_fit_working_set(void) {
+    printf("\n=== TEST 5B: LRU vs Random – working set fits in L1-D ===\n");
+
+    int runs = 20;
+    miss_result_t lru = run_data_scan(FIT_SCAN_BASE, FIT_SCAN_BYTES,
+                                      FIT_SCAN_PASSES, LRU, 0);
+    miss_result_t rnd = average_random_scan(FIT_SCAN_BASE, FIT_SCAN_BYTES,
+                                            FIT_SCAN_PASSES, runs, 500);
+
+    printf("  Scan: %d KB x %d passes\n", FIT_SCAN_BYTES / 1024, FIT_SCAN_PASSES);
+    printf("  LRU   L1-D misses=%-8llu L2 misses=%-6llu\n",
+           (unsigned long long)lru.l1d_misses,
+           (unsigned long long)lru.l2_misses);
+    printf("  RND   L1-D misses=%-8llu L2 misses=%-6llu  (avg over %d seeds)\n",
+           (unsigned long long)rnd.l1d_misses,
+           (unsigned long long)rnd.l2_misses,
+           runs);
+    printf("  Expected: both policies are similar once the working set fits after warmup.\n");
+}
+
+/* ---------------------------------------------------------------
+ * TEST 6 – Random-friendly strided thrash pattern.
  *
  * Access pattern: repeatedly cycle through HW11_L1_DATA_ASSOC+1 addresses
- * that all map to the same L1-D set.  This is the classic
- * "Belady's anomaly" / LRU-thrash scenario.  LRU will miss on
- * every access; Random will occasionally keep a useful line.
+ * that all map to the same L1-D set. This is adversarial to LRU:
+ * it deterministically evicts the line needed next, while Random
+ * occasionally keeps a useful line by chance.
  * ------------------------------------------------------------- */
 static void test_thrash_pattern(void) {
     printf("\n=== TEST 6: LRU vs Random – thrashing pattern ===\n");
 
-    /* Addresses that all map to L1-D set 0:
-     * set 0 is selected by bits [13:6] = 0, so addresses spaced
-     * by L1D_SETS * LINE_SIZE = 256 * 64 = 16384 bytes apart.   */
-    uint64_t stride  = (uint64_t)256 * 64;
-    int      n_addrs = HW11_L1_DATA_ASSOC + 1;   /* one more than ways = thrash */
-    int      iters   = 2000;
+    uint64_t pattern[] = {
+        0 * L1D_SET_STRIDE,
+        1 * L1D_SET_STRIDE,
+        2 * L1D_SET_STRIDE
+    };
+    int repeats = 2000;
+    int runs = 20;
 
-    /* ---- LRU ---- */
-    reset_memory();
-    init_cache(LRU);
-    for (int i = 0; i < iters; i++)
-        for (int a = 0; a < n_addrs; a++)
-            read_cache((uint64_t)a * stride, DATA);
+    miss_result_t lru = run_data_pattern(pattern, 3, repeats, LRU, 0);
+    miss_result_t rnd = average_random_pattern(pattern, 3, repeats, runs, 900);
 
-    uint64_t lru_misses = get_l1_data_stats().misses;
-    printf("  LRU  thrash L1-D misses = %llu / %d accesses\n",
-           (unsigned long long)lru_misses, iters * n_addrs);
-
-    /* ---- Random (avg 10 runs) ---- */
-    uint64_t total = 0;
-    for (int r = 0; r < 10; r++) {
-        reset_memory();
-        init_cache(RANDOM);
-        for (int i = 0; i < iters; i++)
-            for (int a = 0; a < n_addrs; a++)
-                read_cache((uint64_t)a * stride, DATA);
-        total += get_l1_data_stats().misses;
-    }
-    uint64_t rnd_misses = total / 10;
-    printf("  RND  thrash L1-D misses = %llu / %d accesses  (avg 10 runs)\n",
-           (unsigned long long)rnd_misses, iters * n_addrs);
-    printf("  Random %s LRU on thrash pattern (expected: Random <=)\n",
-           rnd_misses <= lru_misses ? "<=" : ">");
+    printf("  Pattern: A, B, C on one 2-way set (%d total accesses)\n",
+           repeats * 3);
+    printf("  LRU   L1-D misses=%-8llu L2 misses=%-6llu\n",
+           (unsigned long long)lru.l1d_misses,
+           (unsigned long long)lru.l2_misses);
+    printf("  RND   L1-D misses=%-8llu L2 misses=%-6llu  (avg over %d seeds)\n",
+           (unsigned long long)rnd.l1d_misses,
+           (unsigned long long)rnd.l2_misses,
+           runs);
+    printf("  Expected: Random <= LRU because this pattern is adversarial to recency.\n");
 }
 
 /* ---------------------------------------------------------------
@@ -297,7 +390,8 @@ int main(int argc, char *argv[]) {
     test_cache_line_pointers();
     test_instr_data_separation();
     test_writeback();
-    test_lru_vs_random();
+    test_lru_friendly_pattern();
+    test_fit_working_set();
     test_thrash_pattern();
     test_modified_bit();
 
