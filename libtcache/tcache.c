@@ -92,8 +92,7 @@ static int pick_victim(cache_line_t *ways, uint32_t *stamps, int num_ways) {
 }
 
 /* ==============================================================
- * L1-I INVALIDATION
- * Not an access — no stat update.
+ * L1-I INVALIDATION  (not an access)
  * ============================================================== */
 static void l1i_invalidate(uint64_t base_addr) {
     uint64_t s  = l1i_idx(base_addr);
@@ -106,34 +105,10 @@ static void l1i_invalidate(uint64_t base_addr) {
 }
 
 /* ==============================================================
- * COHERENCY FLUSH: dirty L1-D data → L2  (NOT an L2 access)
- *
- * Updates L2 data silently so that a subsequent fill_from_l2
- * sees the latest data.  If L2 doesn't hold this line, write
- * directly to main memory so the data isn't lost.
- * ============================================================== */
-static void coherency_flush_to_l2(uint64_t base_addr, uint8_t *data) {
-    uint64_t s  = l2_idx(base_addr);
-    uint64_t tg = l2_tag(base_addr);
-    for (int w = 0; w < L2_WAYS; w++) {
-        if (l2[s][w].valid && l2[s][w].tag == tg) {
-            memcpy(l2[s][w].data, data, LINE_SIZE);
-            l2[s][w].modified = 1;
-            /* Do NOT update lru_stamp — not an access */
-            return;
-        }
-    }
-    /* L2 doesn't have it: write to main memory so data isn't lost */
-    for (int b = 0; b < LINE_SIZE; b++) {
-        write_memory(base_addr + b, data[b]);
-    }
-}
-
-/* ==============================================================
  * L2 INCLUSIVE EVICTION
  *
  * When L2 evicts a line it must also invalidate that line from
- * any L1 cache that holds it.  If the L1-D copy is dirty, write
+ * any L1 cache that holds it.  If the L1-D copy is dirty, flush
  * it straight to main memory (L2 is being evicted too).
  * ============================================================== */
 static void l2_evict_inclusive(uint64_t l2_s, int v) {
@@ -150,10 +125,10 @@ static void l2_evict_inclusive(uint64_t l2_s, int v) {
         lc->modified = 0;
     }
 
-    /* Invalidate L1-I (always clean) */
+    /* Invalidate L1-I (always clean — no writeback needed) */
     l1i_invalidate(base);
 
-    /* Invalidate L1-D; flush to main memory if dirty */
+    /* Invalidate L1-D; if dirty, flush to main memory */
     {
         uint64_t ds  = l1d_idx(base);
         uint64_t dtg = l1d_tag(base);
@@ -175,14 +150,18 @@ static void l2_evict_inclusive(uint64_t l2_s, int v) {
 }
 
 /* ==============================================================
- * WRITEBACK: dirty L1-D line → L2  (counts as L2 access)
+ * WRITEBACK: dirty line → L2  (counts as L2 access)
  *
- * "Write backs from L1 due to eviction or other means" = L2 access.
+ * Used for:
+ *   (a) L1-D eviction writeback
+ *   (b) L1-D coherency writeback before L1-I read (per TA clarification:
+ *       "write backs from L1 due to eviction or other means" = L2 access)
  * ============================================================== */
-static void writeback_l1d_to_l2(uint64_t base_addr, uint8_t *data) {
+static void writeback_to_l2(uint64_t base_addr, uint8_t *data) {
     uint64_t s  = l2_idx(base_addr);
     uint64_t tg = l2_tag(base_addr);
 
+    /* This writeback counts as an L2 access */
     l2_stats_g.accesses++;
 
     for (int w = 0; w < L2_WAYS; w++) {
@@ -194,6 +173,7 @@ static void writeback_l1d_to_l2(uint64_t base_addr, uint8_t *data) {
         }
     }
 
+    /* L2 miss on writeback — install the line */
     l2_stats_g.misses++;
     int victim = pick_victim(l2[s], l2_lru[s], L2_WAYS);
     l2_evict_inclusive(s, victim);
@@ -281,15 +261,19 @@ uint8_t read_cache(uint64_t mem_addr, mem_type_t type) {
         /* L1-I miss */
         l1i_stats.misses++;
 
-        /* Coherency: if L1-D has a dirty copy, flush it to L2 silently
-         * so fill_from_l2 returns the latest data.  Not an L2 access. */
+        /*
+         * Coherency: if L1-D has a dirty copy, write it back to L2
+         * so L1-I reads the latest data from L2.
+         * Per TA: "write backs from L1 due to ... other means" = L2 access.
+         * L1-D remains valid but becomes clean after the writeback.
+         */
         {
             uint64_t ds  = l1d_idx(base);
             uint64_t dtg = l1d_tag(base);
             for (int w = 0; w < L1D_WAYS; w++) {
                 if (l1d[ds][w].valid && l1d[ds][w].tag == dtg
                         && l1d[ds][w].modified) {
-                    coherency_flush_to_l2(base, l1d[ds][w].data);
+                    writeback_to_l2(base, l1d[ds][w].data);
                     l1d[ds][w].modified = 0;
                     break;
                 }
@@ -329,8 +313,8 @@ uint8_t read_cache(uint64_t mem_addr, mem_type_t type) {
 
         int victim = pick_victim(l1d[s], l1d_lru[s], L1D_WAYS);
         if (l1d[s][victim].valid && l1d[s][victim].modified) {
-            writeback_l1d_to_l2(l1d_base(s, l1d[s][victim].tag),
-                                 l1d[s][victim].data);
+            writeback_to_l2(l1d_base(s, l1d[s][victim].tag),
+                            l1d[s][victim].data);
         }
 
         l1d[s][victim].valid    = 1;
@@ -345,7 +329,7 @@ uint8_t read_cache(uint64_t mem_addr, mem_type_t type) {
 
 /* -------------------------------------------------------------- */
 void write_cache(uint64_t mem_addr, uint8_t value, mem_type_t type) {
-    (void)type;  /* writes always go to L1-D */
+    (void)type;  /* writes always target L1-D regardless of type */
     uint64_t off  = line_offset(mem_addr);
     uint64_t base = mem_addr & ~LINE_MASK;
     uint64_t s    = l1d_idx(mem_addr);
@@ -373,8 +357,8 @@ void write_cache(uint64_t mem_addr, uint8_t value, mem_type_t type) {
 
     int victim = pick_victim(l1d[s], l1d_lru[s], L1D_WAYS);
     if (l1d[s][victim].valid && l1d[s][victim].modified) {
-        writeback_l1d_to_l2(l1d_base(s, l1d[s][victim].tag),
-                             l1d[s][victim].data);
+        writeback_to_l2(l1d_base(s, l1d[s][victim].tag),
+                        l1d[s][victim].data);
     }
 
     l1d[s][victim].valid     = 1;
