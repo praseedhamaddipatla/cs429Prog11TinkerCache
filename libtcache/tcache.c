@@ -84,6 +84,9 @@ static int pick_victim(cache_line_t *ways, uint32_t *stamps, int num_ways) {
     for (int w = 0; w < num_ways; w++) {
         if (!ways[w].valid) return w;
     }
+    if (num_ways == 1) {
+        return 0;
+    }
     if (g_policy == RANDOM) {
         return rand() % num_ways;
     }
@@ -259,6 +262,7 @@ static cache_line_t *fill_from_l2(uint64_t mem_addr) {
 void init_cache(replacement_policy_e policy) {
     g_policy  = policy;
     lru_clock = 0;
+    srand(1);
 
     memset(l1i,     0, sizeof(l1i));
     memset(l1d,     0, sizeof(l1d));
