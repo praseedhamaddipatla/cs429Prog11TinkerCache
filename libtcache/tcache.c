@@ -136,6 +136,7 @@ static void writeback_to_l2(uint64_t base_addr, uint8_t *data) {
             for (int w = 0; w < L1I_WAYS; w++) {
                 if (l1i[is][w].valid && l1i[is][w].tag == itg) {
                     if (l1i[is][w].modified) {
+                        l2_stats_g.accesses++; /* writeback from L1-I counts as L2 access */
                         for (int b = 0; b < LINE_SIZE; b++) {
                             write_memory(evict_base + b, l1i[is][w].data[b]);
                         }
@@ -151,6 +152,7 @@ static void writeback_to_l2(uint64_t base_addr, uint8_t *data) {
             for (int w = 0; w < L1D_WAYS; w++) {
                 if (l1d[ds][w].valid && l1d[ds][w].tag == dtg) {
                     if (l1d[ds][w].modified) {
+                        l2_stats_g.accesses++; /* writeback from L1-D counts as L2 access */
                         for (int b = 0; b < LINE_SIZE; b++) {
                             write_memory(evict_base + b, l1d[ds][w].data[b]);
                         }
@@ -203,13 +205,14 @@ static cache_line_t *fill_from_l2(uint64_t mem_addr) {
                 write_memory(evict_base + b, l2[s][victim].data[b]);
             }
         }
-        /* invalidate L1-I copy */
+        /* invalidate / flush L1-I copy */
         {
             uint64_t is  = l1i_idx(evict_base);
             uint64_t itg = l1i_tag(evict_base);
             for (int w = 0; w < L1I_WAYS; w++) {
                 if (l1i[is][w].valid && l1i[is][w].tag == itg) {
                     if (l1i[is][w].modified) {
+                        l2_stats_g.accesses++; /* writeback from L1-I counts as L2 access */
                         for (int b = 0; b < LINE_SIZE; b++) {
                             write_memory(evict_base + b, l1i[is][w].data[b]);
                         }
@@ -218,13 +221,14 @@ static cache_line_t *fill_from_l2(uint64_t mem_addr) {
                 }
             }
         }
-        /* invalidate L1-D copy */
+        /* invalidate / flush L1-D copy */
         {
             uint64_t ds  = l1d_idx(evict_base);
             uint64_t dtg = l1d_tag(evict_base);
             for (int w = 0; w < L1D_WAYS; w++) {
                 if (l1d[ds][w].valid && l1d[ds][w].tag == dtg) {
                     if (l1d[ds][w].modified) {
+                        l2_stats_g.accesses++; /* writeback from L1-D counts as L2 access */
                         for (int b = 0; b < LINE_SIZE; b++) {
                             write_memory(evict_base + b, l1d[ds][w].data[b]);
                         }
@@ -240,7 +244,6 @@ static cache_line_t *fill_from_l2(uint64_t mem_addr) {
     l2[s][victim].valid    = 1;
     l2[s][victim].modified = 0;
     l2[s][victim].tag      = tg;
-    /* lru handled via l2_lru array below */
     l2_lru[s][victim]      = ++lru_clock;
     for (int b = 0; b < LINE_SIZE; b++) {
         l2[s][victim].data[b] = read_memory(base + b);
@@ -338,6 +341,22 @@ uint8_t read_cache(uint64_t mem_addr, mem_type_t type) {
 
         /* L1-D miss */
         l1d_stats.misses++;
+
+        /* Coherency: if L1-I has a dirty copy of this line, write it back
+         * to L2 first so that L1-D reads the latest data from L2.
+         * "Write backs from L1 due to other means" = L2 access. */
+        {
+            uint64_t is  = l1i_idx(base);
+            uint64_t itg = l1i_tag(base);
+            for (int w = 0; w < L1I_WAYS; w++) {
+                if (l1i[is][w].valid && l1i[is][w].tag == itg
+                        && l1i[is][w].modified) {
+                    writeback_to_l2(base, l1i[is][w].data);
+                    l1i[is][w].modified = 0;
+                    break;
+                }
+            }
+        }
 
         cache_line_t *l2line = fill_from_l2(mem_addr);
 
